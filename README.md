@@ -109,6 +109,26 @@ A positive OOS expectancy is *necessary, not sufficient* — paper-trade any
 candidate for weeks before risking a cent. If nothing clears zero, that's a real
 answer: no tradeable edge here.
 
+## Cross-sectional momentum (a different kind of edge)
+Single-asset indicator timing (everything above) is the most picked-over,
+lowest-edge corner of the market — which is why it doesn't survive validation on
+SOL. `momentum.py` tries a fundamentally different approach with an actual
+economic rationale: rank a **basket** of liquid coins by recent return and go
+**long the strongest / short the weakest**, rebalanced periodically, roughly
+dollar-neutral. Momentum is the most robustly documented anomaly across asset
+classes (incl. crypto). It trades on **daily/4h** horizons, not intraday.
+
+```bash
+# fetch a basket of daily candles, then validate with walk-forward + holdout
+python3 fetch_data.py --symbols BTC/USDT ETH/USDT SOL/USDT BNB/USDT XRP/USDT \
+    ADA/USDT AVAX/USDT LINK/USDT DOGE/USDT LTC/USDT --timeframe 1d --days 1000
+python3 momentum.py --csv *_1d.csv
+```
+It reports rolling out-of-sample and a locked-holdout Sharpe/return/drawdown.
+Honest expectation: better odds than indicator timing, but still modest returns,
+real drawdowns, momentum-crash risk, and decay — not a money machine. Funding and
+slippage are only approximated; model them before trusting any live number.
+
 ## Tuning
 Everything lives in `config.json`. Sane things to change first: `symbol`,
 `timeframe`, `risk_dollars` (your hard per-trade loss cap), `rr` (reward:risk;
