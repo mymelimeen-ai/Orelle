@@ -1,0 +1,23 @@
+{
+  "exchange": "binanceusdm",
+  "symbol": "SOL/USDT",
+  "timeframe": "15m",
+  "ema_fast": 21,
+  "ema_slow": 55,
+  "rsi_len": 14,
+  "rsi_long_max": 70.0,
+  "rsi_short_min": 30.0,
+  "atr_len": 14,
+  "equity": 1000.0,
+  "risk_per_trade": 0.01,
+  "atr_stop_mult": 2.0,
+  "rr": 1.8,
+  "max_leverage": 3.0,
+  "max_daily_drawdown": 0.05,
+  "fee": 0.0005,
+  "fixed_notional": 0.0,
+  "margin": 100.0,
+  "leverage": 20.0,
+  "liq_buffer": 0.8,
+  "maint_margin": 0.005
+}
