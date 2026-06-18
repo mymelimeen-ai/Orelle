@@ -136,76 +136,119 @@ def in_sample_best(df, base, strategy, bpd, min_trades):
     return best_metrics, best_combo
 
 
+def evaluate(df, base, strategies, args):
+    """For one coin/file: walk-forward each strategy on the development data, and
+    (if a holdout is set) score the per-strategy chosen params once on a final,
+    never-touched holdout. Returns (bpd, holdout_days_used, rows)."""
+    bpd = detect_bpd(df)
+    n = len(df)
+    hb = int(args.holdout_days * bpd) if args.holdout_days > 0 else 0
+    if hb and hb >= n * 0.4:                  # keep enough development data
+        hb = int(n * 0.2)
+    dev_end = n - hb if hb else n
+    dev = df.iloc[:dev_end]
+
+    rows = []
+    for strat in strategies:
+        oos, _, _ = walk_forward(dev, base, strat, bpd,
+                                 args.train_days, args.test_days, args.min_train_trades)
+        ins, combo = in_sample_best(dev, base, strat, bpd, args.min_train_trades)
+        hold = None
+        if hb and combo is not None:
+            cfg = replace(base, strategy=strat, **combo)
+            tr, _ = _simulate(prepare_indicators(df, cfg).iloc[dev_end:], cfg, build_curve=False)
+            hold = _aggregate(tr, hb / bpd)
+        if oos:
+            rows.append((strat, oos, ins, hold, combo))
+    return bpd, (hb / bpd if hb else 0), rows
+
+
+def report(label, bpd, holdout_days, rows, base):
+    print(f"\n{'='*78}\n{label}   (~{bpd:.0f} bars/day)")
+    if not rows:
+        print("  no strategy could be evaluated (not enough data).")
+        return None
+    use_hold = holdout_days > 0 and any(r[3] for r in rows)
+    key = (lambda r: (r[3] or {}).get("expectancy_R", -9) if use_hold
+           else r[1]["expectancy_R"])
+    rows = sorted(rows, key=key, reverse=True)
+    hdr = f"{'strategy':<18}{'OOS expR':>10}{'OOS PF':>8}{'OOS trd':>9}"
+    if use_hold:
+        hdr += f"{'HOLD expR':>11}{'HOLD PF':>9}{'HOLD trd':>10}"
+    hdr += f"{'IS expR':>9}"
+    print(hdr); print("-" * len(hdr))
+    for strat, oos, ins, hold, combo in rows:
+        line = f"{strat:<18}{oos['expectancy_R']:>10}{oos['profit_factor']:>8}{oos['trades']:>9}"
+        if use_hold:
+            h = hold or {}
+            line += (f"{h.get('expectancy_R', float('nan')):>11}"
+                     f"{h.get('profit_factor', float('nan')):>9}{h.get('trades', 0):>10}")
+        line += f"{(ins or {}).get('expectancy_R', float('nan')):>9}"
+        print(line)
+
+    # verdict — require positive OOS AND (if available) positive holdout
+    def good(oos, hold):
+        if oos["expectancy_R"] <= 0 or oos["profit_factor"] <= 1.0 or oos["trades"] < 30:
+            return False
+        if use_hold:
+            return bool(hold) and hold["expectancy_R"] > 0 and hold["trades"] >= 10
+        return True
+    edge = [(s, o, h, c) for (s, o, i, h, c) in rows if good(o, h)]
+    if not edge:
+        print("VERDICT: no strategy survived"
+              + (" out-of-sample AND the locked holdout." if use_hold else " out-of-sample."))
+        return None
+    s, o, h, c = edge[0]
+    final = (h or o)
+    print(f"VERDICT: '{s}' survived — expR {final['expectancy_R']}, PF {final['profit_factor']}, "
+          f"{final['trades']} trades"
+          + (" on the locked holdout." if use_hold else " out-of-sample."))
+    return replace(base, strategy=s, **c)
+
+
 def main():
-    p = argparse.ArgumentParser(description="walk-forward strategy search")
-    p.add_argument("--csv", default=None, help="OHLCV CSV (real data)")
+    p = argparse.ArgumentParser(description="walk-forward strategy search (multi-coin)")
+    p.add_argument("--csv", nargs="+", default=None, help="one or more OHLCV CSVs (real data)")
     p.add_argument("--config", default=None, help="base config.json (risk settings)")
     p.add_argument("--offline", action="store_true", help="synthetic smoke test")
     p.add_argument("--strategies", nargs="+", default=list(GRIDS),
                    choices=list(_STRATEGIES))
     p.add_argument("--train-days", type=float, default=90)
     p.add_argument("--test-days", type=float, default=30)
+    p.add_argument("--holdout-days", type=float, default=60,
+                   help="final locked holdout in days (0 to disable); guards against "
+                        "data-dredging across coins/strategies")
     p.add_argument("--min-train-trades", type=int, default=8)
     args = p.parse_args()
 
     base = Config.load(args.config) if args.config else Config()
     if args.offline:
-        df = synthetic(n=20000)
+        sources = [("synthetic", synthetic(n=20000))]
     elif args.csv:
-        df = load_csv(args.csv)
+        sources = [(f, load_csv(f)) for f in args.csv]
     else:
-        raise SystemExit("Pass --csv <file> (real data) or --offline (smoke test).")
+        raise SystemExit("Pass --csv <file...> (real data) or --offline (smoke test).")
 
-    bpd = detect_bpd(df)
-    span_days = (df.index[-1] - df.index[0]).total_seconds() / 86400
-    print(f"data: {len(df)} bars  {df.index[0]} -> {df.index[-1]}  (~{span_days:.0f} days)")
-    print(f"walk-forward: train {args.train_days}d / test {args.test_days}d, "
-          f"rolling. OOS = out-of-sample (the number that matters).\n")
+    print(f"walk-forward train {args.train_days}d / test {args.test_days}d, "
+          f"locked holdout {args.holdout_days}d. OOS + HOLD are the honest numbers.")
+    winners = []
+    for label, df in sources:
+        span = (df.index[-1] - df.index[0]).total_seconds() / 86400
+        bpd, hold_days, rows = evaluate(df, base, args.strategies, args)
+        w = report(f"{label}  [{len(df)} bars, ~{span:.0f}d]", bpd, hold_days, rows, base)
+        if w:
+            winners.append((label, w))
 
-    rows = []
-    for strat in args.strategies:
-        oos, nfolds, _ = walk_forward(df, base, strat, bpd,
-                                      args.train_days, args.test_days, args.min_train_trades)
-        ins, combo = in_sample_best(df, base, strat, bpd, args.min_train_trades)
-        if not oos:
-            print(f"  {strat:<18} not enough data for walk-forward")
-            continue
-        rows.append((strat, oos, ins, combo, nfolds))
-
-    if not rows:
-        print("No strategy could be evaluated on this data.")
+    print("\n" + "#" * 78)
+    if not winners:
+        print("FINAL: across every coin and strategy tested, nothing survived validation.")
+        print("That is the honest result — no tradeable edge found. Do not risk money.")
         return
-
-    rows.sort(key=lambda x: x[1]["expectancy_R"], reverse=True)
-    hdr = f"{'strategy':<18}{'OOS expR':>10}{'OOS win%':>9}{'OOS PF':>8}" \
-          f"{'OOS trades':>11}{'trd/day':>9}{'OOS net$':>10}{'IS expR':>9}"
-    print(hdr)
-    print("-" * len(hdr))
-    for strat, oos, ins, combo, nfolds in rows:
-        is_r = ins["expectancy_R"] if ins else float("nan")
-        print(f"{strat:<18}{oos['expectancy_R']:>10}{oos['win_rate']*100:>8.1f}%"
-              f"{oos['profit_factor']:>8}{oos['trades']:>11}{oos['trades_per_day']:>9}"
-              f"{oos['net_usd']:>10}{is_r:>9}")
-
-    print("\nLegend: OOS = unseen test windows (honest). IS = fit to all data "
-          "(optimistic; the gap to OOS is the overfitting tax).")
-
-    # verdict
-    edge = [(s, o, i, c) for (s, o, i, c, _) in rows
-            if o["expectancy_R"] > 0 and o["profit_factor"] > 1.0 and o["trades"] >= 30]
-    print("\n" + "=" * 70)
-    if not edge:
-        print("VERDICT: no strategy showed a positive, trustworthy out-of-sample edge.")
-        print("That is a real result — on this data, none of these is worth trading.")
-        return
-    best_strat, best_oos, _, best_combo = edge[0]
-    print(f"VERDICT: '{best_strat}' is the only/best candidate with positive OOS edge:")
-    print(f"  expectancy {best_oos['expectancy_R']}R/trade, PF {best_oos['profit_factor']}, "
-          f"{best_oos['trades_per_day']} trades/day, {best_oos['trades']} trades OOS.")
-    winner = replace(base, strategy=best_strat, **best_combo)
-    winner.save("config.research.json")
-    print("  Wrote config.research.json. Next: paper-trade it for weeks before any live use.")
-    print("  (OOS edge is necessary, not sufficient — confirm it holds forward in paper.)")
+    label, w = winners[0]
+    w.save("config.research.json")
+    print(f"FINAL: best survivor was '{w.strategy}' on {label}. Wrote config.research.json.")
+    print("Even so: paper-trade it forward for weeks before any live use. A holdout pass")
+    print("is necessary, not proof — forward performance is the only thing that pays.")
 
 
 if __name__ == "__main__":
