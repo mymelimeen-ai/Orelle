@@ -31,7 +31,7 @@ import logging
 import math
 import time
 from collections import defaultdict
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from datetime import datetime, timezone
 
 import numpy as np
@@ -75,6 +75,7 @@ class Config:
     bb_len: int = 20                    # bollinger length
     bb_std: float = 2.0                 # bollinger band width (std devs)
     donchian_len: int = 20              # breakout lookback
+    htf_rule: str = "15min"             # mtf: slow timeframe to resample to (input = 1m)
 
     # --- account / risk (the part that actually matters) ---
     equity: float = 1000.0              # your working capital in quote ccy
@@ -161,6 +162,38 @@ def add_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return df
 
 
+def add_mtf_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Multi-timeframe: the input is the FAST timeframe (e.g. 1m). We compute the
+    entry-timeframe indicators on it, then resample to the SLOW timeframe
+    (cfg.htf_rule, e.g. '15min') for the trend bias and align it back — using only
+    *closed* slow bars (shift by one) so there is no lookahead."""
+    df = df.copy()
+    # fast-timeframe (entry) indicators
+    df["rsi"] = rsi(df["close"], cfg.rsi_len)
+    df["atr"] = atr(df, cfg.atr_len)
+    df["ema_fast"] = ema(df["close"], cfg.ema_fast)
+    df["ema_slow"] = ema(df["close"], cfg.ema_slow)
+
+    # slow-timeframe (bias) via resample
+    rs = df.resample(cfg.htf_rule, label="left", closed="left")
+    htf = pd.DataFrame({
+        "open": rs["open"].first(), "high": rs["high"].max(),
+        "low": rs["low"].min(), "close": rs["close"].last(),
+    }).dropna()
+    ef, es = ema(htf["close"], cfg.ema_fast), ema(htf["close"], cfg.ema_slow)
+    htf_trend = np.sign(ef - es)                     # +1 up / -1 down
+    htf_adx = adx(htf, cfg.adx_len)
+    # only known AFTER the slow bar closes -> shift one slow bar, then ffill onto fast
+    df["htf_trend"] = htf_trend.shift(1).reindex(df.index, method="ffill")
+    df["htf_adx"] = htf_adx.shift(1).reindex(df.index, method="ffill")
+    return df
+
+
+def prepare_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Route to the right indicator builder for the configured strategy."""
+    return add_mtf_indicators(df, cfg) if cfg.strategy == "mtf" else add_indicators(df, cfg)
+
+
 # -----------------------------------------------------------------------------
 # Strategy  ->  returns -1 / 0 / +1 for the *current* closed bar
 # -----------------------------------------------------------------------------
@@ -231,12 +264,29 @@ def _sig_donchian(df: pd.DataFrame, i: int, cfg: Config) -> int:
     return 0
 
 
+def _sig_mtf(df: pd.DataFrame, i: int, cfg: Config) -> int:
+    """Multi-timeframe: take a 1m RSI pullback ONLY in the direction of the
+    closed-15m trend (and only when that trend is strong enough, via 15m ADX)."""
+    if i < cfg.rsi_len + 1:
+        return 0
+    trend, adx15 = df["htf_trend"].iloc[i], df["htf_adx"].iloc[i]
+    if math.isnan(trend) or adx15 < cfg.adx_min:
+        return 0
+    r0, r1 = df["rsi"].iloc[i - 1], df["rsi"].iloc[i]
+    if trend > 0 and r0 <= cfg.rsi_os and r1 > cfg.rsi_os:
+        return 1
+    if trend < 0 and r0 >= cfg.rsi_ob and r1 < cfg.rsi_ob:
+        return -1
+    return 0
+
+
 _STRATEGIES = {
     "ema_cross": _sig_ema_cross,
     "ema_cross_adx": _sig_ema_cross_adx,
     "rsi_reversion": _sig_rsi_reversion,
     "bb_reversion": _sig_bb_reversion,
     "donchian_breakout": _sig_donchian,
+    "mtf": _sig_mtf,
 }
 
 
@@ -287,6 +337,15 @@ def signals_array(df: pd.DataFrame, cfg: Config) -> np.ndarray:
         c = df["close"].to_numpy(); hi = df["dc_high"].to_numpy(); lo = df["dc_low"].to_numpy()
         sig[c > hi] = 1; sig[c < lo] = -1
         sig[np.isnan(hi)] = 0
+    elif strat == "mtf":
+        r = df["rsi"].to_numpy()
+        trend = df["htf_trend"].to_numpy(); adx15 = df["htf_adx"].to_numpy()
+        up = np.zeros(n, bool); dn = np.zeros(n, bool)
+        up[1:] = (r[:-1] <= cfg.rsi_os) & (r[1:] > cfg.rsi_os)
+        dn[1:] = (r[:-1] >= cfg.rsi_ob) & (r[1:] < cfg.rsi_ob)
+        ok = ~np.isnan(trend) & (adx15 >= cfg.adx_min)
+        sig[up & ok & (trend > 0)] = 1
+        sig[dn & ok & (trend < 0)] = -1
     else:
         raise ValueError(f"unknown strategy {strat!r}")
     return sig
@@ -421,7 +480,7 @@ def _simulate(df: pd.DataFrame, cfg: Config, build_curve: bool = True):
 
 def backtest(df: pd.DataFrame, cfg: Config) -> dict:
     """Full backtest: add indicators, simulate, summarize."""
-    trades, curve = _simulate(add_indicators(df, cfg), cfg)
+    trades, curve = _simulate(prepare_indicators(df, cfg), cfg)
     return summarize(trades, curve, cfg)
 
 
@@ -515,12 +574,12 @@ def load_csv(path: str) -> pd.DataFrame:
     return df.set_index(tcol)[["open", "high", "low", "close", "volume"]].sort_index()
 
 
-def synthetic(n: int = 3000, seed: int = 7) -> pd.DataFrame:
+def synthetic(n: int = 3000, seed: int = 7, freq: str = "15min") -> pd.DataFrame:
     """Offline demo data: GBM with regime shifts, so the engine runs anywhere.
     NOTE: this is random noise, NOT a real market. Use it to verify mechanics
     only — never to judge whether the strategy is profitable on a real symbol."""
     rng = np.random.default_rng(seed)
-    idx = pd.date_range("2024-01-01", periods=n, freq="15min", tz="UTC")
+    idx = pd.date_range("2024-01-01", periods=n, freq=freq, tz="UTC")
     drift = np.concatenate([rng.normal(m, 0, n // 3) for m in (0.0002, -0.0003, 0.0001)])
     if len(drift) < n:                       # n not divisible by 3 -> pad the tail
         drift = np.concatenate([drift, np.full(n - len(drift), 0.0001)])
@@ -552,9 +611,14 @@ def run_live(cfg: Config, live: bool, key: str = "", secret: str = ""):
     consec_losses = 0
     pos = None
 
+    # MTF needs enough fast bars to build the slow-timeframe trend
+    htf_mult = (_tf_seconds(cfg.htf_rule.replace("min", "m")) // _tf_seconds(cfg.timeframe)
+                if cfg.strategy == "mtf" else 1)
+    fetch_limit = (cfg.ema_slow + 50) * max(htf_mult, 1)
+
     while True:
         try:
-            df = add_indicators(fetch_ohlcv(cfg, limit=cfg.ema_slow + 50), cfg)
+            df = prepare_indicators(fetch_ohlcv(cfg, limit=fetch_limit), cfg)
             i = len(df) - 1
             row, price = df.iloc[i], df["close"].iloc[i]
 
@@ -610,12 +674,16 @@ def main():
     p.add_argument("--config", default=None, help="path to config.json")
     p.add_argument("--offline", action="store_true", help="backtest on synthetic data (mechanics only)")
     p.add_argument("--csv", default=None, help="backtest on a local OHLCV CSV (real data, no network)")
+    p.add_argument("--strategy", default=None, choices=list(_STRATEGIES),
+                   help="override the strategy in the config")
     p.add_argument("--live", action="store_true", help="REQUIRED to place real orders")
     p.add_argument("--key", default="")
     p.add_argument("--secret", default="")
     args = p.parse_args()
 
     cfg = Config.load(args.config) if args.config else Config()
+    if args.strategy:
+        cfg = replace(cfg, strategy=args.strategy)
 
     if args.mode == "backtest":
         if args.csv:

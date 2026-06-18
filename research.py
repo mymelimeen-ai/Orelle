@@ -27,8 +27,8 @@ from itertools import product
 
 import numpy as np
 
-from bot import (Config, add_indicators, _simulate, load_csv, synthetic,
-                 _tf_seconds, _STRATEGIES)
+from bot import (Config, prepare_indicators, _simulate, load_csv, synthetic,
+                 _STRATEGIES)
 
 
 # Parameter grids per strategy. Kept modest so a full run finishes in minutes.
@@ -43,11 +43,24 @@ GRIDS = {
                           "rr": [1.0, 1.5], "atr_stop_mult": [2.0]},
     "donchian_breakout": {"donchian_len": [20, 55], "rr": [1.5, 2.5],
                           "atr_stop_mult": [2.0, 3.0]},
+    # multi-timeframe: 1m entries (RSI pullback) filtered by the 15m trend.
+    # Feed a 1m CSV; the 15m bias is derived internally.
+    "mtf":               {"rsi_os": [25, 30], "rsi_ob": [70, 75],
+                          "rr": [1.5, 2.5], "adx_min": [20]},
 }
 
 
 def _combos(grid):
     return [dict(zip(grid, vals)) for vals in product(*grid.values())]
+
+
+def detect_bpd(df):
+    """Bars per day inferred from the data itself, so any timeframe CSV works.
+    Uses Timedelta.total_seconds() to stay agnostic to pandas' datetime unit."""
+    if len(df) < 3:
+        return 96.0
+    sec = df.index.to_series().diff().dropna().median().total_seconds()
+    return 86400.0 / sec if sec and sec > 0 else 96.0
 
 
 def _aggregate(trades, test_days):
@@ -97,12 +110,12 @@ def walk_forward(df, base, strategy, bpd, train_days, test_days, min_train_trade
         best, best_score = None, -1e18
         for combo in combos:
             cfg = replace(base, strategy=strategy, **combo)
-            tr, _ = _simulate(add_indicators(df.iloc[:b], cfg).iloc[a:b], cfg, build_curve=False)
+            tr, _ = _simulate(prepare_indicators(df.iloc[:b], cfg).iloc[a:b], cfg, build_curve=False)
             sc = _train_score(tr, min_train_trades)
             if sc > best_score:
                 best_score, best = sc, combo
         cfg = replace(base, strategy=strategy, **best)
-        tr, _ = _simulate(add_indicators(df.iloc[:c], cfg).iloc[b:c], cfg, build_curve=False)
+        tr, _ = _simulate(prepare_indicators(df.iloc[:c], cfg).iloc[b:c], cfg, build_curve=False)
         oos_trades += tr
     return _aggregate(oos_trades, len(folds) * test_days), len(folds), combos
 
@@ -113,7 +126,7 @@ def in_sample_best(df, base, strategy, bpd, min_trades):
     best_combo, best_r, best_metrics = None, -1e18, None
     for combo in _combos(GRIDS[strategy]):
         cfg = replace(base, strategy=strategy, **combo)
-        tr, _ = _simulate(add_indicators(df, cfg), cfg, build_curve=False)
+        tr, _ = _simulate(prepare_indicators(df, cfg), cfg, build_curve=False)
         if len(tr) < min_trades:
             continue
         r = float(np.mean([t["r"] for t in tr]))
@@ -143,7 +156,7 @@ def main():
     else:
         raise SystemExit("Pass --csv <file> (real data) or --offline (smoke test).")
 
-    bpd = 86400 / _tf_seconds(base.timeframe)
+    bpd = detect_bpd(df)
     span_days = (df.index[-1] - df.index[0]).total_seconds() / 86400
     print(f"data: {len(df)} bars  {df.index[0]} -> {df.index[-1]}  (~{span_days:.0f} days)")
     print(f"walk-forward: train {args.train_days}d / test {args.test_days}d, "

@@ -84,6 +84,31 @@ whether this is profitable on **SOL 15m**, backtest **real** SOL candles
 across months, then paper trade for weeks. If paper isn't green, live won't be
 either — and you'll have learned that for free instead of for $1,000.
 
+## Strategies & finding an edge
+`bot.py` ships five single-timeframe strategies plus a multi-timeframe one,
+selected via `strategy` in the config (or `--strategy` on the CLI):
+`ema_cross`, `ema_cross_adx` (trend + ADX/regime filter), `rsi_reversion`,
+`bb_reversion`, `donchian_breakout`, and `mtf`.
+
+**`mtf` (multi-timeframe):** feed a **1-minute** CSV; it derives the 15m trend
+internally (resampled, no lookahead) and only takes 1m RSI-pullback entries that
+agree with the 15m trend. Configure the slow timeframe with `htf_rule`.
+```bash
+python3 bot.py backtest --config config.mtf.json --csv sol_1m.csv
+```
+
+**Don't trust a single backtest — validate.** `research.py` runs walk-forward
+validation (tune on a train window, score on the next *unseen* window, roll
+forward) and reports only the out-of-sample result, with the in-sample number
+beside it so overfitting is visible:
+```bash
+python3 research.py --csv sol_1m.csv          # tests all strategies, incl. mtf
+python3 research.py --csv sol_15m.csv --strategies ema_cross_adx rsi_reversion
+```
+A positive OOS expectancy is *necessary, not sufficient* — paper-trade any
+candidate for weeks before risking a cent. If nothing clears zero, that's a real
+answer: no tradeable edge here.
+
 ## Tuning
 Everything lives in `config.json`. Sane things to change first: `symbol`,
 `timeframe`, `risk_dollars` (your hard per-trade loss cap), `rr` (reward:risk;
