@@ -215,9 +215,10 @@ def backtest(df: pd.DataFrame, cfg: Config) -> dict:
         d = ts.date()
         price = row["close"]
 
-        # new day -> reset the daily guards
+        # new day -> reset the daily guards (matches the live loop)
         if d != day:
             day, day_start_equity, halted_today = d, equity, False
+            consec_losses = 0
 
         # manage open position against this bar's high/low
         if pos:
