@@ -64,6 +64,18 @@ class Config:
     atr_stop_mult: float = 2.0          # stop = entry -/+ 2*ATR
     rr: float = 3.0                     # take-profit at 3x risk -> $100 risk targets $300
 
+    # --- strategy selection & per-strategy params ---
+    # ema_cross | ema_cross_adx | rsi_reversion | bb_reversion | donchian_breakout
+    strategy: str = "ema_cross"
+    adx_len: int = 14
+    adx_min: float = 20.0               # ema_cross_adx: require trend strength >= this (skip chop)
+    htf_len: int = 200                  # ema_cross_adx: long-trend EMA used as a regime filter
+    rsi_os: float = 30.0                # rsi_reversion oversold / bb re-entry threshold
+    rsi_ob: float = 70.0                # rsi_reversion overbought
+    bb_len: int = 20                    # bollinger length
+    bb_std: float = 2.0                 # bollinger band width (std devs)
+    donchian_len: int = 20              # breakout lookback
+
     # --- account / risk (the part that actually matters) ---
     equity: float = 1000.0              # your working capital in quote ccy
     risk_model: str = "fixed_risk"      # "fixed_risk" (recommended) or "margin" (legacy)
@@ -112,10 +124,24 @@ def rsi(s: pd.Series, n: int) -> pd.Series:
     rs = up / dn.replace(0, np.nan)
     return (100 - 100 / (1 + rs)).fillna(50)
 
-def atr(df: pd.DataFrame, n: int) -> pd.Series:
+def _true_range(df: pd.DataFrame) -> pd.Series:
     h, l, c = df["high"], df["low"], df["close"]
-    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / n, adjust=False).mean()
+    return pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+
+def atr(df: pd.DataFrame, n: int) -> pd.Series:
+    return _true_range(df).ewm(alpha=1 / n, adjust=False).mean()
+
+def adx(df: pd.DataFrame, n: int) -> pd.Series:
+    """Wilder's ADX — trend-strength gauge. High = trending, low (<~20) = chop."""
+    up = df["high"].diff()
+    dn = -df["low"].diff()
+    plus_dm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=df.index)
+    atr_w = _true_range(df).ewm(alpha=1 / n, adjust=False).mean().replace(0, np.nan)
+    plus_di = 100 * plus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr_w
+    minus_di = 100 * minus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr_w
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return dx.ewm(alpha=1 / n, adjust=False).mean().fillna(0.0)
 
 def add_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     df = df.copy()
@@ -123,14 +149,23 @@ def add_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     df["ema_slow"] = ema(df["close"], cfg.ema_slow)
     df["rsi"] = rsi(df["close"], cfg.rsi_len)
     df["atr"] = atr(df, cfg.atr_len)
+    # extra indicators used by the alternative strategies (cheap to always compute)
+    df["adx"] = adx(df, cfg.adx_len)
+    df["htf_ema"] = ema(df["close"], cfg.htf_len)
+    mid = df["close"].rolling(cfg.bb_len).mean()
+    sd = df["close"].rolling(cfg.bb_len).std(ddof=0)
+    df["bb_upper"] = mid + cfg.bb_std * sd
+    df["bb_lower"] = mid - cfg.bb_std * sd
+    df["dc_high"] = df["high"].rolling(cfg.donchian_len).max().shift(1)
+    df["dc_low"] = df["low"].rolling(cfg.donchian_len).min().shift(1)
     return df
 
 
 # -----------------------------------------------------------------------------
 # Strategy  ->  returns -1 / 0 / +1 for the *current* closed bar
 # -----------------------------------------------------------------------------
-def signal(df: pd.DataFrame, i: int, cfg: Config) -> int:
-    """Trend (EMA cross) gated by an RSI filter so we don't chase extremes."""
+def _sig_ema_cross(df: pd.DataFrame, i: int, cfg: Config) -> int:
+    """Trend: EMA fast/slow cross, gated by an RSI filter so we don't chase extremes."""
     if i < cfg.ema_slow + 1:
         return 0
     fast, slow = df["ema_fast"], df["ema_slow"]
@@ -142,6 +177,119 @@ def signal(df: pd.DataFrame, i: int, cfg: Config) -> int:
     if crossed_dn and r > cfg.rsi_short_min:
         return -1
     return 0
+
+
+def _sig_ema_cross_adx(df: pd.DataFrame, i: int, cfg: Config) -> int:
+    """EMA cross, but only in a trending regime (ADX) and aligned with the
+    higher-timeframe trend. This is the 'don't trade chop' fix for the bleed we saw."""
+    base = _sig_ema_cross(df, i, cfg)
+    if base == 0:
+        return 0
+    if df["adx"].iloc[i] < cfg.adx_min:          # too choppy -> sit out
+        return 0
+    price, htf = df["close"].iloc[i], df["htf_ema"].iloc[i]
+    if base == 1 and price < htf:                # long only with the long-term trend
+        return 0
+    if base == -1 and price > htf:               # short only against it
+        return 0
+    return base
+
+
+def _sig_rsi_reversion(df: pd.DataFrame, i: int, cfg: Config) -> int:
+    """Mean reversion: buy when RSI climbs back out of oversold, sell out of overbought."""
+    if i < cfg.rsi_len + 1:
+        return 0
+    r0, r1 = df["rsi"].iloc[i - 1], df["rsi"].iloc[i]
+    if r0 <= cfg.rsi_os and r1 > cfg.rsi_os:
+        return 1
+    if r0 >= cfg.rsi_ob and r1 < cfg.rsi_ob:
+        return -1
+    return 0
+
+
+def _sig_bb_reversion(df: pd.DataFrame, i: int, cfg: Config) -> int:
+    """Mean reversion: buy when price re-enters from below the lower Bollinger band."""
+    if i < cfg.bb_len + 1 or math.isnan(df["bb_lower"].iloc[i]):
+        return 0
+    c0, c1 = df["close"].iloc[i - 1], df["close"].iloc[i]
+    if c0 < df["bb_lower"].iloc[i - 1] and c1 >= df["bb_lower"].iloc[i]:
+        return 1
+    if c0 > df["bb_upper"].iloc[i - 1] and c1 <= df["bb_upper"].iloc[i]:
+        return -1
+    return 0
+
+
+def _sig_donchian(df: pd.DataFrame, i: int, cfg: Config) -> int:
+    """Breakout: long when price closes above the prior N-bar high, short below the low."""
+    if i < cfg.donchian_len + 1 or math.isnan(df["dc_high"].iloc[i]):
+        return 0
+    c = df["close"].iloc[i]
+    if c > df["dc_high"].iloc[i]:
+        return 1
+    if c < df["dc_low"].iloc[i]:
+        return -1
+    return 0
+
+
+_STRATEGIES = {
+    "ema_cross": _sig_ema_cross,
+    "ema_cross_adx": _sig_ema_cross_adx,
+    "rsi_reversion": _sig_rsi_reversion,
+    "bb_reversion": _sig_bb_reversion,
+    "donchian_breakout": _sig_donchian,
+}
+
+
+def signal(df: pd.DataFrame, i: int, cfg: Config) -> int:
+    """Dispatch to the configured strategy. Returns -1 / 0 / +1 for closed bar i.
+    Used by the live loop; the backtester uses the vectorized signals_array()."""
+    try:
+        return _STRATEGIES[cfg.strategy](df, i, cfg)
+    except KeyError:
+        raise ValueError(f"unknown strategy {cfg.strategy!r}; "
+                         f"choices: {', '.join(_STRATEGIES)}")
+
+
+def signals_array(df: pd.DataFrame, cfg: Config) -> np.ndarray:
+    """Vectorized equivalent of signal() for the whole frame — same semantics,
+    far faster than calling signal() per bar in the backtest loop."""
+    n = len(df)
+    sig = np.zeros(n, dtype=np.int8)
+    strat = cfg.strategy
+    if strat in ("ema_cross", "ema_cross_adx"):
+        f = df["ema_fast"].to_numpy(); s = df["ema_slow"].to_numpy(); r = df["rsi"].to_numpy()
+        up = np.zeros(n, bool); dn = np.zeros(n, bool)
+        up[1:] = (f[:-1] <= s[:-1]) & (f[1:] > s[1:])
+        dn[1:] = (f[:-1] >= s[:-1]) & (f[1:] < s[1:])
+        sig[up & (r < cfg.rsi_long_max)] = 1
+        sig[dn & (r > cfg.rsi_short_min)] = -1
+        sig[:cfg.ema_slow + 1] = 0
+        if strat == "ema_cross_adx":
+            price = df["close"].to_numpy(); htf = df["htf_ema"].to_numpy()
+            sig[df["adx"].to_numpy() < cfg.adx_min] = 0
+            sig[(sig == 1) & (price < htf)] = 0
+            sig[(sig == -1) & (price > htf)] = 0
+    elif strat == "rsi_reversion":
+        r = df["rsi"].to_numpy()
+        up = np.zeros(n, bool); dn = np.zeros(n, bool)
+        up[1:] = (r[:-1] <= cfg.rsi_os) & (r[1:] > cfg.rsi_os)
+        dn[1:] = (r[:-1] >= cfg.rsi_ob) & (r[1:] < cfg.rsi_ob)
+        sig[up] = 1; sig[dn] = -1
+        sig[:cfg.rsi_len + 1] = 0
+    elif strat == "bb_reversion":
+        c = df["close"].to_numpy(); lo = df["bb_lower"].to_numpy(); up_ = df["bb_upper"].to_numpy()
+        L = np.zeros(n, bool); S = np.zeros(n, bool)
+        L[1:] = (c[:-1] < lo[:-1]) & (c[1:] >= lo[1:])
+        S[1:] = (c[:-1] > up_[:-1]) & (c[1:] <= up_[1:])
+        sig[L] = 1; sig[S] = -1
+        sig[np.isnan(lo)] = 0
+    elif strat == "donchian_breakout":
+        c = df["close"].to_numpy(); hi = df["dc_high"].to_numpy(); lo = df["dc_low"].to_numpy()
+        sig[c > hi] = 1; sig[c < lo] = -1
+        sig[np.isnan(hi)] = 0
+    else:
+        raise ValueError(f"unknown strategy {strat!r}")
+    return sig
 
 
 # -----------------------------------------------------------------------------
@@ -198,70 +346,82 @@ def size_position(equity: float, entry: float, stop: float, cfg: Config,
 # -----------------------------------------------------------------------------
 # Backtester
 # -----------------------------------------------------------------------------
-def backtest(df: pd.DataFrame, cfg: Config) -> dict:
-    df = add_indicators(df, cfg)
-    equity = cfg.equity
-    peak = equity
-    pos = None                 # dict: side, entry, stop, tp, qty, risk
-    day = None
+def _simulate(df: pd.DataFrame, cfg: Config, build_curve: bool = True):
+    """Run the engine over a df that ALREADY has indicators. Returns (trades, curve).
+    Kept separate so the walk-forward research harness can simulate data slices.
+    Uses numpy arrays + a precomputed signal vector for speed; set build_curve=False
+    to skip the per-bar equity curve when only trades are needed (research)."""
+    n = len(df)
+    highs = df["high"].to_numpy(float); lows = df["low"].to_numpy(float)
+    closes = df["close"].to_numpy(float); atrs = df["atr"].to_numpy(float)
+    sig_arr = signals_array(df, cfg)
+    idx = df.index
+    day_ids = idx.normalize().asi8          # int per calendar day, for the daily reset
+    msm, rr, fee = cfg.atr_stop_mult, cfg.rr, cfg.fee
+    mdd, max_cl = cfg.max_daily_drawdown, cfg.max_consec_losses
+
+    equity = peak = cfg.equity
+    pos = None
+    cur_day = None
     day_start_equity = equity
     halted_today = False
     consec_losses = 0
     trades, curve = [], []
 
-    for i in range(len(df)):
-        row = df.iloc[i]
-        ts = df.index[i]
-        d = ts.date()
-        price = row["close"]
+    for i in range(n):
+        price = closes[i]
 
         # new day -> reset the daily guards (matches the live loop)
-        if d != day:
-            day, day_start_equity, halted_today = d, equity, False
-            consec_losses = 0
+        if day_ids[i] != cur_day:
+            cur_day, day_start_equity, halted_today, consec_losses = day_ids[i], equity, False, 0
 
         # manage open position against this bar's high/low
-        if pos:
+        if pos is not None:
             if pos["side"] == 1:
-                hit_stop = row["low"] <= pos["stop"]
-                hit_tp = row["high"] >= pos["tp"]
+                hit_stop, hit_tp = lows[i] <= pos["stop"], highs[i] >= pos["tp"]
             else:
-                hit_stop = row["high"] >= pos["stop"]
-                hit_tp = row["low"] <= pos["tp"]
+                hit_stop, hit_tp = highs[i] >= pos["stop"], lows[i] <= pos["tp"]
             # if a bar straddles both, assume the stop fills first (conservative)
             exit_px = pos["stop"] if hit_stop else (pos["tp"] if hit_tp else None)
             if exit_px is not None:
                 pnl = pos["side"] * (exit_px - pos["entry"]) * pos["qty"]
-                pnl -= cfg.fee * pos["qty"] * (pos["entry"] + exit_px)
+                pnl -= fee * pos["qty"] * (pos["entry"] + exit_px)
                 equity += pnl
                 consec_losses = consec_losses + 1 if pnl < 0 else 0
                 trades.append({
-                    "time": str(ts), "side": pos["side"],
+                    "time": str(idx[i]), "side": pos["side"],
                     "entry": pos["entry"], "exit": exit_px, "qty": pos["qty"],
                     "pnl": pnl, "r": pnl / pos["risk"] if pos["risk"] else 0.0,
                 })
                 pos = None
 
         # daily drawdown lockout — the single most important guard in the file
-        if equity <= day_start_equity * (1 - cfg.max_daily_drawdown):
+        if equity <= day_start_equity * (1 - mdd):
             halted_today = True
 
         # look for entries only when flat, not halted, not on a losing streak
-        if pos is None and not halted_today and consec_losses < cfg.max_consec_losses:
-            sig = signal(df, i, cfg)
-            if sig != 0 and not math.isnan(row["atr"]):
+        if pos is None and not halted_today and consec_losses < max_cl:
+            sig = int(sig_arr[i])
+            a = atrs[i]
+            if sig != 0 and not math.isnan(a):
                 entry = price
-                stop = entry - sig * cfg.atr_stop_mult * row["atr"]
-                tp = entry + sig * cfg.atr_stop_mult * row["atr"] * cfg.rr
+                stop = entry - sig * msm * a
+                tp = entry + sig * msm * a * rr
                 qty = size_position(equity, entry, stop, cfg, sig)
                 if qty > 0:
-                    risk = abs(entry - stop) * qty
-                    pos = {"side": sig, "entry": entry, "stop": stop,
-                           "tp": tp, "qty": qty, "risk": risk}
+                    pos = {"side": sig, "entry": entry, "stop": stop, "tp": tp,
+                           "qty": qty, "risk": abs(entry - stop) * qty}
 
-        peak = max(peak, equity)
-        curve.append({"time": str(ts), "equity": equity, "drawdown": equity / peak - 1})
+        if build_curve:
+            peak = max(peak, equity)
+            curve.append({"time": str(idx[i]), "equity": equity, "drawdown": equity / peak - 1})
 
+    return trades, curve
+
+
+def backtest(df: pd.DataFrame, cfg: Config) -> dict:
+    """Full backtest: add indicators, simulate, summarize."""
+    trades, curve = _simulate(add_indicators(df, cfg), cfg)
     return summarize(trades, curve, cfg)
 
 
@@ -361,7 +521,10 @@ def synthetic(n: int = 3000, seed: int = 7) -> pd.DataFrame:
     only — never to judge whether the strategy is profitable on a real symbol."""
     rng = np.random.default_rng(seed)
     idx = pd.date_range("2024-01-01", periods=n, freq="15min", tz="UTC")
-    drift = np.concatenate([rng.normal(m, 0, n // 3) for m in (0.0002, -0.0003, 0.0001)])[:n]
+    drift = np.concatenate([rng.normal(m, 0, n // 3) for m in (0.0002, -0.0003, 0.0001)])
+    if len(drift) < n:                       # n not divisible by 3 -> pad the tail
+        drift = np.concatenate([drift, np.full(n - len(drift), 0.0001)])
+    drift = drift[:n]
     rets = drift + rng.normal(0, 0.004, n)
     close = 60000 * np.exp(np.cumsum(rets))
     high = close * (1 + np.abs(rng.normal(0, 0.002, n)))
