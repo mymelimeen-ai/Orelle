@@ -71,31 +71,37 @@ def bars_per_year(idx) -> float:
 
 # --- portfolio backtest ------------------------------------------------------
 def backtest_xs(prices, lookback, rebal, quantile, vol_adjust,
-                fee=0.0005, gross=1.0, start=0, end=None):
+                cost=0.0007, funding_annual=0.0, bpy=365.0, gross=1.0, start=0, end=None):
     """Long top / short bottom by momentum, rebalanced every `rebal` bars,
     dollar-neutral. Signals use full history (no warmup loss); trading is active
     only on [start, end). No lookahead: a bar's return uses weights set on a
-    PRIOR bar, and the rebalance at bar t uses only info through t."""
+    PRIOR bar, and the rebalance at bar t uses only info through t.
+
+    Costs modeled: `cost` per unit of turnover at each rebalance (commission +
+    slippage), and `funding_annual` as a per-bar drag on gross exposure (a
+    conservative stand-in for perp funding, which is a real drag on a momentum
+    book whose longs are hot, high-funding names). Returns (rets, curve, turnover)."""
     end = len(prices) if end is None else end
     rets = prices.pct_change().fillna(0.0)
     mom = prices / prices.shift(lookback) - 1.0
     vol = rets.rolling(lookback).std()
     sig = (mom / vol.replace(0, np.nan)) if vol_adjust else mom
+    fund_per_bar = funding_annual / bpy
 
     cols = prices.columns
     W = pd.Series(0.0, index=cols)
     prev_W = W.copy()
     equity = 1.0
-    port_rets = []
-    curve = []
+    port_rets, curve, turnover_sum = [], [], 0.0
 
     for t in range(start, end):
-        # apply this bar's return with weights held from the last rebalance
+        # apply this bar's return + funding drag, weights held from last rebalance
         if t > start:
             r = float((W * rets.iloc[t]).sum())
+            r -= fund_per_bar * float(W.abs().sum())     # funding drag on gross
             equity *= (1.0 + r)
             port_rets.append(r)
-            if equity <= 0:                      # ruin guard
+            if equity <= 0:                              # ruin guard
                 curve.append(0.0)
                 break
         # rebalance at end of bar t (uses info through close t)
@@ -112,20 +118,23 @@ def backtest_xs(prices, lookback, rebal, quantile, vol_adjust,
                 if lw.sum() > 0 and sw.sum() > 0:
                     w[longs] = (lw / lw.sum()) * (gross / 2)
                     w[shorts] = -(sw / sw.sum()) * (gross / 2)
-                    equity *= (1.0 - fee * float((w - prev_W).abs().sum()))
+                    turnover = float((w - prev_W).abs().sum())
+                    turnover_sum += turnover
+                    equity *= (1.0 - cost * turnover)
                     prev_W, W = w.copy(), w
         curve.append(equity)
 
-    return np.array(port_rets), np.array(curve)
+    return np.array(port_rets), np.array(curve), turnover_sum
 
 
-def metrics(port_rets, curve, bpy) -> dict | None:
+def metrics(port_rets, curve, bpy, turnover=0.0) -> dict | None:
     if len(port_rets) == 0 or len(curve) == 0:
         return None
     pr = np.asarray(port_rets)
     eq = np.asarray(curve)
     final = max(eq[-1], 1e-9)
-    ann_ret = final ** (bpy / len(pr)) - 1.0
+    years = len(pr) / bpy
+    ann_ret = final ** (1 / years) - 1.0 if years > 0 else 0.0
     ann_vol = pr.std() * np.sqrt(bpy)
     sharpe = (pr.mean() * bpy) / ann_vol if ann_vol > 0 else 0.0
     peak = np.maximum.accumulate(eq)
@@ -135,8 +144,9 @@ def metrics(port_rets, curve, bpy) -> dict | None:
         "ann_return_pct": round(float(ann_ret) * 100, 1),
         "ann_vol_pct": round(float(ann_vol) * 100, 1),
         "max_drawdown_pct": round(dd * 100, 1),
-        "total_return_pct": round((final - 1.0) * 100, 1),
+        "total_return_pct": round(float((final - 1.0) * 100), 1),
         "pct_positive": round(float((pr > 0).mean()) * 100, 1),
+        "ann_turnover": round(float(turnover / years), 1) if years > 0 else 0.0,
         "periods": len(pr),
     }
 
@@ -146,42 +156,47 @@ def _combos():
     return [dict(zip(GRID, v)) for v in product(*GRID.values())]
 
 
-def evaluate(prices, train, test, holdout, fee, gross):
+def evaluate(prices, train, test, holdout, cost, funding, gross):
     bpy = bars_per_year(prices.index)
     n = len(prices)
     hb = holdout if 0 < holdout < n * 0.4 else (int(n * 0.2) if holdout else 0)
     dev_end = n - hb if hb else n
+
+    def run(combo, a, b):
+        return backtest_xs(prices, **combo, cost=cost, funding_annual=funding,
+                           bpy=bpy, gross=gross, start=a, end=b)
 
     # rolling walk-forward over the development span -> concatenated OOS returns
     folds, s = [], 0
     while s + train + test <= dev_end:
         folds.append((s, s + train, s + train + test))
         s += test
-    oos = []
+    oos, oos_to = [], 0.0
     for a, b, c in folds:
         best, bscore = None, -1e18
         for combo in _combos():
-            pr, cv = backtest_xs(prices, **combo, fee=fee, gross=gross, start=a, end=b)
+            pr, cv, _ = run(combo, a, b)
             m = metrics(pr, cv, bpy)
             sc = m["sharpe"] if m and m["periods"] >= test * 0.3 else -1e18
             if sc > bscore:
                 bscore, best = sc, combo
         if best:
-            pr, _ = backtest_xs(prices, **best, fee=fee, gross=gross, start=b, end=c)
+            pr, _, to = run(best, b, c)
             oos.extend(pr.tolist())
-    oos_m = metrics(np.array(oos), np.cumprod(1 + np.array(oos)) if oos else [], bpy) if oos else None
+            oos_to += to
+    oos_m = metrics(np.array(oos), np.cumprod(1 + np.array(oos)), bpy, oos_to) if oos else None
 
     # one combo chosen on ALL dev data, scored ONCE on the locked holdout
     dev_best, dev_score = None, -1e18
     for combo in _combos():
-        pr, cv = backtest_xs(prices, **combo, fee=fee, gross=gross, start=0, end=dev_end)
+        pr, cv, _ = run(combo, 0, dev_end)
         m = metrics(pr, cv, bpy)
         if m and m["periods"] >= train * 0.3 and m["sharpe"] > dev_score:
             dev_score, dev_best = m["sharpe"], combo
     hold_m = None
     if hb and dev_best:
-        pr, cv = backtest_xs(prices, **dev_best, fee=fee, gross=gross, start=dev_end, end=n)
-        hold_m = metrics(pr, cv, bpy)
+        pr, cv, to = run(dev_best, dev_end, n)
+        hold_m = metrics(pr, cv, bpy, to)
     return bpy, hb, oos_m, hold_m, dev_best
 
 
@@ -192,7 +207,10 @@ def main():
     p.add_argument("--train", type=int, default=252, help="train window (bars)")
     p.add_argument("--test", type=int, default=63, help="test window (bars)")
     p.add_argument("--holdout", type=int, default=126, help="locked holdout (bars); 0=off")
-    p.add_argument("--fee", type=float, default=0.0005, help="cost per unit turnover")
+    p.add_argument("--cost", type=float, default=0.0007,
+                   help="cost per unit turnover (commission + slippage; ~7bps default)")
+    p.add_argument("--funding", type=float, default=0.10,
+                   help="assumed annual funding drag on gross exposure (stress 0.0-0.3)")
     p.add_argument("--gross", type=float, default=1.0, help="gross leverage (0.5 long+0.5 short=1)")
     args = p.parse_args()
 
@@ -208,11 +226,12 @@ def main():
 
     print(f"basket: {len(prices.columns)} coins, {len(prices)} bars  "
           f"{prices.index[0]} -> {prices.index[-1]}")
+    print(f"costs: {args.cost*1e4:.0f}bps/turnover + {args.funding*100:.0f}%/yr funding drag")
     print(f"walk-forward train {args.train} / test {args.test} bars, "
           f"locked holdout {args.holdout} bars. Sharpe is the headline number.\n")
 
     bpy, hb, oos, hold, best = evaluate(prices, args.train, args.test,
-                                        args.holdout, args.fee, args.gross)
+                                        args.holdout, args.cost, args.funding, args.gross)
     print(f"(~{bpy:.0f} bars/year)")
     print("OUT-OF-SAMPLE (rolling, honest):", json.dumps(oos) if oos else "n/a")
     if hb:
